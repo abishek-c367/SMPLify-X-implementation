@@ -47,6 +47,8 @@ from smplifyx.fit_single_frame import fit_single_frame
 from smplifyx.camera import create_camera
 from smplifyx.prior import create_prior
 from OpenPose.detect_keypoints import OpenPoseKeypointConverter
+from human_body_prior.human_body_prior.tools.model_loader import load_model, load_vposer
+
 torch.backends.cudnn.enabled = False
 
 
@@ -251,6 +253,13 @@ def main(**args):
     # Add a fake batch dimension for broadcasting
     joint_weights.unsqueeze_(dim=0)
 #======================================================================================
+    use_vposer = args.get('use_vposer', True)
+    if use_vposer:
+        vposer_ckpt = osp.expandvars(args.get('vposer_ckpt'))
+        vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
+        vposer = vposer.to(device=device)
+        vposer.eval()
+
     
     for idx, data in enumerate(dataset_obj):
         """
@@ -267,6 +276,7 @@ def main(**args):
         print('Processing: {}'.format(data['img_path']))
 
         curr_result_folder = osp.join(result_folder, fn)
+        print(f'{curr_result_folder=}')
         if not osp.exists(curr_result_folder):
             os.makedirs(curr_result_folder)
         curr_mesh_folder = osp.join(mesh_folder, fn)
@@ -320,6 +330,7 @@ def main(**args):
                              right_hand_prior=right_hand_prior,
                              jaw_prior=jaw_prior,
                              angle_prior=angle_prior,
+                             vposer=vposer,
                              **args)
 
     elapsed = time.time() - start

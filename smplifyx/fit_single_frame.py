@@ -87,9 +87,10 @@ def fit_single_frame(img,
                      rho=100,
                      vposer_latent_dim=32,
                      vposer_ckpt='',
+                     vposer=None,
                      use_joints_conf=False,
                      interactive=True,
-                     visualize=False,
+                     visualize=True,
                      save_meshes=True,
                      degrees=None,
                      batch_size=1,
@@ -179,16 +180,16 @@ def fit_single_frame(img,
             len(body_pose_prior_weights)), msg
 
     use_vposer = kwargs.get('use_vposer', True)
-    vposer, pose_embedding = [None, ] * 2
+    pose_embedding = [None, ]
     if use_vposer:
         pose_embedding = torch.zeros([batch_size, 32],
                                      dtype=dtype, device=device,
                                      requires_grad=True)
 
-        vposer_ckpt = osp.expandvars(vposer_ckpt)
-        vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
-        vposer = vposer.to(device=device)
-        vposer.eval()
+        # vposer_ckpt = osp.expandvars(vposer_ckpt)
+        # vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
+        # vposer = vposer.to(device=device)
+        # vposer.eval()
 
     if use_vposer:
         body_mean_pose = torch.zeros([batch_size, vposer_latent_dim],
@@ -274,15 +275,31 @@ def fit_single_frame(img,
                                             dtype=dtype)
 
     # The indices of the joints used for the initialization of the camera
+    '''init_joints_idxs------->It identifies which joints to use for initializing the camera translation. The default indices (9, 12, 2, 5) correspond to:
+
+        9 = Right hip
+        12 = Left hip
+        2 = Right shoulder
+        5 = Left shoulder
+    These four joints form two limbs (hips and shoulders) that are used to estimate the initial depth of the camera relative to the body.'''
+ 
     init_joints_idxs = torch.tensor(init_joints_idxs, device=device)
 
+  
     edge_indices = kwargs.get('body_tri_idxs')
-    init_t = fitting.guess_init(body_model, gt_joints, edge_indices,
+   
+    #added camera and img as parameter
+    '''fitting.guess_init() ---->compute a good initial estimate of the camera translation, specifically the depth 
+    (z-coordinate). This initial guess prevents the optimizer from starting from a completely 
+    unreasonable camera position.'''
+    init_t = fitting.guess_init(body_model, camera, gt_joints, edge_indices,
                                 use_vposer=use_vposer, vposer=vposer,
                                 pose_embedding=pose_embedding,
-                                model_type=kwargs.get('model_type', 'smpl'),
-                                focal_length=focal_length, dtype=dtype)
-
+                                model_type=kwargs.get('model_type', 'smplx'),
+                                focal_length=focal_length, dtype=dtype,
+                                img=img)
+    #camera_loss is a class object of SMPLifyCameraInitLoss() in fitting.py
+    #It has modules to compute total camera loss(joint loss and depth loss)
     camera_loss = fitting.create_loss('camera_init',
                                       trans_estimation=init_t,
                                       init_joints_idxs=init_joints_idxs,
@@ -290,6 +307,7 @@ def fit_single_frame(img,
                                       dtype=dtype).to(device=device)
     camera_loss.trans_estimation[:] = init_t
 
+#===========================================
     loss = fitting.create_loss(loss_type=loss_type,
                                joint_weights=joint_weights,
                                rho=rho,
@@ -350,6 +368,9 @@ def fit_single_frame(img,
             **kwargs)
 
         # The closure passed to the optimizer
+        '''monitor.create_fitting_closure() returns a function named fitting_func().This function 
+            returns the total loss camera plus body .'''
+        #fit_camera is the closure that computes the loss
         fit_camera = monitor.create_fitting_closure(
             camera_optimizer, body_model, camera, gt_joints,
             camera_loss, create_graph=camera_create_graph,
@@ -394,7 +415,7 @@ def fit_single_frame(img,
 
         # store here the final error for both orientations,
         # and pick the orientation resulting in the lowest error
-        '''
+        # '''
         results = []
 #=================================================================================================================================>>>>>>>>>
         # Step 2: Optimize the full model
@@ -404,17 +425,37 @@ def fit_single_frame(img,
 
             new_params = defaultdict(global_orient=orient,
                                      body_pose=body_mean_pose)
-            body_model.reset_params(**new_params)
+            body_model.reset_params(**new_params) #The purpose is to initialize the model parameters to known values instead of continuing from the previous optimization.
             if use_vposer:
                 with torch.no_grad():
                     pose_embedding.fill_(0)
-
+            '''
+            SMPLify-X uses a multi-stage optimization strategy in which the same set of
+            model parameters (e.g., body pose, shape, global orientation, hands, and
+            face) are optimized throughout the fitting process. Instead of changing the
+            parameters being optimized, each stage changes only the weights of the different 
+            loss terms, such as the data fitting loss, pose prior, shape prior, hand prior, and face prior.
+            The optimization starts with strong prior weights to keep the estimated body in a realistic 
+            configuration while achieving a coarse alignment with the detected 2D keypoints. In later stages,
+            the prior weights are gradually reduced and the data fitting weight is increased, allowing the model
+            to better match the observed image. This coarse-to-fine optimization strategy improves convergence, 
+            prevents unrealistic poses, and reduces the likelihood of getting trapped in poor local minima.
+            '''
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights, desc='Stage')):
 
                 body_params = list(body_model.parameters())
 
+                # for param_name, param  in body_model.named_parameters():
+                #     print(param_name, param.requires_grad)#-----------
+#=================================================================================================================================>>>>>>>>>
+
                 final_params = list(
                     filter(lambda x: x.requires_grad, body_params))
+               
+                # print("\nOptimized parameters:")#--------------
+                # for param_name, param  in body_model.named_parameters():
+                #     print(param_name, param.requires_grad)#-----------
+                # exit()
 
                 if use_vposer:
                     final_params.append(pose_embedding)
@@ -485,6 +526,11 @@ def fit_single_frame(img,
             results.append({'loss': final_loss_val,
                             'result': result})
 
+        # Create the directory for result_fn if it doesn't exist
+        result_dir = osp.dirname(result_fn)
+        if result_dir and not osp.exists(result_dir):
+            os.makedirs(result_dir, exist_ok=True)
+
         with open(result_fn, 'wb') as result_file:
             if len(results) > 1:
                 min_idx = (0 if results[0]['loss'] < results[1]['loss']
@@ -492,11 +538,19 @@ def fit_single_frame(img,
             else:
                 min_idx = 0
             pickle.dump(results[min_idx]['result'], result_file, protocol=2)
+            print(f'Fitting result saved to {result_fn}')
 
     if save_meshes or visualize:
-        body_pose = vposer.decode(
-            pose_embedding,
-            output_type='aa').view(1, -1) if use_vposer else None
+        if use_vposer:
+            vposer_output = vposer.decode(pose_embedding)
+            if isinstance(vposer_output, dict):
+                body_pose = vposer_output.get('pose_body')
+            else:
+                body_pose = vposer_output
+            if body_pose is not None:
+                body_pose = body_pose.reshape(1, -1)
+        else:
+            body_pose = None
 
         model_type = kwargs.get('model_type', 'smpl')
         append_wrists = model_type == 'smpl' and use_vposer
@@ -515,7 +569,14 @@ def fit_single_frame(img,
         rot = trimesh.transformations.rotation_matrix(
             np.radians(180), [1, 0, 0])
         out_mesh.apply_transform(rot)
+        
+        # Create the directory for mesh_fn if it doesn't exist
+        mesh_dir = osp.dirname(mesh_fn)
+        if mesh_dir and not osp.exists(mesh_dir):
+            os.makedirs(mesh_dir, exist_ok=True)
+        
         out_mesh.export(mesh_fn)
+        print(f'Mesh saved to {mesh_fn}')
 
     if visualize:
         import pyrender
@@ -563,5 +624,11 @@ def fit_single_frame(img,
                       (1 - valid_mask) * input_img)
 
         img = pil_img.fromarray((output_img * 255).astype(np.uint8))
+        
+        # Create the directory for out_img_fn if it doesn't exist
+        out_img_dir = osp.dirname(out_img_fn)
+        if out_img_dir and not osp.exists(out_img_dir):
+            os.makedirs(out_img_dir, exist_ok=True)
+        
         img.save(out_img_fn)
-'''
+        print(f'Visualization image saved to {out_img_fn}')

@@ -54,7 +54,7 @@ class SMPLifyAnglePrior(nn.Module):
     def __init__(self, dtype=torch.float32, **kwargs):
         super(SMPLifyAnglePrior, self).__init__()
 
-        # Indices for the roration angle of
+        # Indices for the rotation angle of
         # 55: left elbow,  90deg bend at -np.pi/2
         # 58: right elbow, 90deg bend at np.pi/2
         # 12: left knee,   90deg bend at np.pi/2
@@ -83,6 +83,18 @@ class SMPLifyAnglePrior(nn.Module):
         Returns:
             A sze (B) tensor containing the angle prior loss for each element
             in the batch.
+
+            The angle prior computes, for each selected hinge joint,
+
+        L(angle)=(exp(s.θ))^2
+
+        where:
+        θi = is the selected axis-angle component for joint i,
+        si∈{−1,+1} is the sign that defines which bending direction is anatomically valid.
+        This produces a one-sided penalty:
+
+        Correct bending direction → very small cost.
+        Wrong bending direction → exponentially increasing cost.
         '''
         angle_prior_idxs = self.angle_prior_idxs - (not with_global_pose) * 3
         return torch.exp(pose[:, angle_prior_idxs] *
