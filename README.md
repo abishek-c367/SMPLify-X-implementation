@@ -38,6 +38,17 @@ This repository contains the fitting code used for the experiments in [Expressiv
 ### Fitting 
 Run the following command to execute the code:
 ```Shell
+#To run the code
+#Use this for now
+python .\smplifyx\main.py --config .\cfg_files\fit_smplx.yaml `
+     --data_folder .\DATA_FOLDER `
+     --model_folder .\smplx_models `
+     --visualize="True/False"
+     --vposer_ckpt C:\Abishek\SMPLify\human_body_prior\support_data\dowloads\V02_05
+
+
+
+#Skip this
 python smplifyx/main.py --config cfg_files/fit_smplx.yaml 
     --data_folder DATA_FOLDER 
     --output_folder OUTPUT_FOLDER 

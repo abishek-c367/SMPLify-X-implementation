@@ -30,11 +30,11 @@ import torch
 import torch.nn as nn
 
 from mesh_viewer import MeshViewer
-import utils
+import smplifyx.utils as utils
 
 
 @torch.no_grad()
-def guess_init(model,
+def guess_init(model,camera,
                joints_2d,
                edge_idxs,
                focal_length=5000,
@@ -42,7 +42,8 @@ def guess_init(model,
                vposer=None,
                use_vposer=True,
                dtype=torch.float32,
-               model_type='smpl',
+               model_type='smplx',
+               img=None,
                **kwargs):
     ''' Initializes the camera translation vector
 
@@ -64,6 +65,8 @@ def guess_init(model,
             The floating point type used
         vposer: nn.Module, optional (None)
             The PyTorch module that implements the V-Poser decoder
+        img: np.ndarray, optional (None)
+            Input image for visualization
         Returns
         -------
         init_t: torch.tensor 1x3, dtype = torch.float32
@@ -79,7 +82,8 @@ def guess_init(model,
             body_pose = vposer_output
         if body_pose is None:
             raise ValueError('VPoser decode did not return a pose_body tensor.')
-        body_pose = body_pose.view(1, -1)
+        body_pose = body_pose.reshape(1, -1)
+
     else:
         body_pose = None
 
@@ -88,11 +92,61 @@ def guess_init(model,
                                  dtype=body_pose.dtype,
                                  device=body_pose.device)
         body_pose = torch.cat([body_pose, wrist_pose], dim=1)
-
+    # model() is a class of SMPLX model. Given input (1,63) smpl parameters, it 
+    # provides an output class with parameters like (3D)vetices, joints, betas, etc
+    # smplx\smplx\body_models.SMPLX.forward()
     output = model(body_pose=body_pose, return_verts=False,
                    return_full_pose=False)
+    
     joints_3d = output.joints
+
+    #joints_2d are the keypoints detected by OpenPose
     joints_2d = joints_2d.to(device=joints_3d.device)
+    '''
+    #======================================================
+    print("3D joints shape :", joints_3d.shape)
+    print("2D joints shape :", joints_2d.shape)
+
+    assert joints_3d.shape[1] == joints_2d.shape[1], \
+        "Number of joints does not match!"
+
+    print("Joint count matches!")
+    print(f'edge_idxs : {edge_idxs}')
+
+    # Project 3D joints to 2D using camera
+    projected_joints = camera.forward(joints_3d)
+    
+    # Visualization of 2D detected vs 3D projected joints
+    if img is not None:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        
+        # Normalize image to [0, 1] if needed
+        img_vis = img if img.max() <= 1.0 else img / 255.0
+        ax.imshow(img_vis)
+        
+        # Plot detected 2D joints (red circles)
+        joints_2d_np = joints_2d[0].detach().cpu().numpy()
+        ax.scatter(joints_2d_np[:, 0], joints_2d_np[:, 1], 
+                   c='red', s=50, marker='o', label='Detected 2D joints', alpha=0.7)
+        
+        # Plot projected 3D joints (green circles)
+        projected_np = projected_joints[0].detach().cpu().numpy()
+        ax.scatter(projected_np[:, 0], projected_np[:, 1], 
+                   c='green', s=40, marker='x', label='Projected 3D joints', alpha=0.7, linewidths=2)
+        
+        ax.legend()
+        ax.set_title('Camera Initialization: 2D Detected vs 3D Projected Joints')
+        ax.set_xlabel('X (pixels)')
+        ax.set_ylabel('Y (pixels)')
+        plt.tight_layout()
+        plt.savefig('joint_visualization.png', dpi=100)
+        print("Joint visualization saved to 'joint_visualization.png'")
+        plt.close()
+    '''
+    #=================================================================
 
     diff3d = []
     diff2d = []
@@ -208,9 +262,16 @@ class FittingMonitor(object):
                 break
 
             if self.visualize and n % self.summary_steps == 0:
-                body_pose = vposer.decode(
-                    pose_embedding, output_type='aa').view(
-                        1, -1) if use_vposer else None
+                if use_vposer:
+                    vposer_output = vposer.decode(pose_embedding)
+                    if isinstance(vposer_output, dict):
+                        body_pose = vposer_output.get('pose_body')
+                    else:
+                        body_pose = vposer_output
+                    if body_pose is not None:
+                        body_pose = body_pose.reshape(1, -1)
+                else:
+                    body_pose = None
 
                 if append_wrists:
                     wrist_pose = torch.zeros([body_pose.shape[0], 6],
@@ -245,9 +306,16 @@ class FittingMonitor(object):
             if backward:
                 optimizer.zero_grad()
 
-            body_pose = vposer.decode(
-                pose_embedding, output_type='aa').view(
-                    1, -1) if use_vposer else None
+            if use_vposer:
+                vposer_output = vposer.decode(pose_embedding)
+                if isinstance(vposer_output, dict):
+                    body_pose = vposer_output.get('pose_body')
+                else:
+                    body_pose = vposer_output
+                if body_pose is not None:
+                    body_pose = body_pose.reshape(1, -1)
+            else:
+                body_pose = None
 
             if append_wrists:
                 wrist_pose = torch.zeros([body_pose.shape[0], 6],
@@ -389,11 +457,25 @@ class SMPLifyLoss(nn.Module):
 
         # Calculate the distance of the projected joints from
         # the ground truth 2D detections
+        '''self.robustifier(...) — applies a robust loss function (commonly GMoF — Geman-McClure robust error)
+          instead of plain squared error. This matters a lot in practice: squared error lets a single badly-mismatched
+          keypoint (e.g., a misdetected wrist) dominate the whole loss and drag the fit toward a bad pose. A robust 
+          loss saturates for large errors, effectively down-weighting outlier keypoints automatically.
+        '''
         joint_diff = self.robustifier(gt_joints - projected_joints)
         joint_loss = (torch.sum(weights ** 2 * joint_diff) *
                       self.data_weight ** 2)
+        # self.data_weight — remember this from the camera-init stage discussion (1000/H)? Same normalization idea, 
+        # scaling the loss to be resolution-independent.
 
         # Calculate the loss from the Pose prior
+        '''
+        Pose prior/regularization — without this, the reprojection loss alone is under-constrained (many different 3D poses
+        can look identical from one camera angle), so the optimizer needs a nudge toward "plausible human poses." If using VPoser,
+        the trick is beautifully simple: VPoser's latent space is trained so that a standard normal distribution corresponds to
+        plausible poses — so penalizing pose_embedding.pow(2).sum() (basically an L2/Gaussian-prior penalty) discourages 
+        drifting into implausible latent regions, without needing an explicit pose-prior network. Without VPoser, it falls
+        back to a classical Gaussian Mixture Model prior over raw pose angles instead.'''
         if use_vposer:
             pprior_loss = (pose_embedding.pow(2).sum() *
                            self.body_pose_weight ** 2)
